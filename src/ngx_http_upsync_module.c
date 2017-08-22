@@ -1661,15 +1661,16 @@ ngx_http_upsync_etcd_parse_json(void *data)
         upstream_conf->down = 0;
         upstream_conf->backup = 0;
 
+        cJSON *sub_attribute
         temp0 = cJSON_GetObjectItem(server_next, "value");
         if (temp0 != NULL && ngx_strlen(temp0->valuestring) != 0) {
             if (isEtcdv3) {
                 src->len = sizeof(*temp0->valuestring) - 1;
                 src->data = (u_char *) temp0->valuestring;
                 ngx_decode_base64(dst, src);
-                cJSON *sub_attribute = cJSON_Parse((char *)dst->data);
+                sub_attribute = cJSON_Parse((char *)dst->data);
             } else {
-                cJSON *sub_attribute = cJSON_Parse((char *)temp0->valuestring);
+                sub_attribute = cJSON_Parse((char *)temp0->valuestring);
             }
 
             if (sub_attribute == NULL) {
