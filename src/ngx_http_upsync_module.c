@@ -1546,17 +1546,17 @@ static ngx_int_t
 ngx_http_upsync_etcd_parse_json(void *data)
 {
     u_char                         *p;
-    bool                            isEtcdv3 = false;
+    int                            isEtcdv3 = 0;
     ngx_buf_t                      *buf;
-    ngx_str_t                      *src; // base64 source
-    ngx_str_t                      *dst; // base64 decode str
+    ngx_str_t                      *src; // base64 decode src
+    ngx_str_t                      *dst; // base64 decode dst
     ngx_int_t                       max_fails=2, backup=0, down=0;
     ngx_http_upsync_ctx_t          *ctx;
     ngx_http_upsync_conf_t         *upstream_conf = NULL;
     ngx_http_upsync_server_t       *upsync_server = data;
 
     if (&upsync_server->upscf->upsync_type_conf->upsync_type == NGX_HTTP_UPSYNC_ETCDV3) {
-        isEtcdv3 = true;
+        isEtcdv3 = 1;
     }
     ctx = &upsync_server->ctx;
     buf = &ctx->body;
