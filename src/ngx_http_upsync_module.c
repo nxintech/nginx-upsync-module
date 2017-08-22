@@ -90,6 +90,7 @@ typedef struct {
 
     ngx_str_t                        upsync_send;
     ngx_str_t                        upsync_dump_path;
+    ngx_str_t                        upsync_etcd3_key;
 
     ngx_open_file_t                 *conf_file;
 
@@ -456,6 +457,20 @@ ngx_http_upsync_server(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             if (upscf->upsync_type_conf == NULL) {
                 ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                                    "upsync_server: upsync_type invalid para");
+                goto invalid;
+            }
+
+            continue;
+        }
+
+        if (ngx_strncmp(value[i].data, "etcd3_key=", 10) == 0) {
+            s.len = value[i].len - 10;
+            s.data = value[i].data + 10;
+
+            upscf->upsync_etcd3_key = s;
+            if (upscf->upsync_etcd3_key == NULL) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "upsync_server: etcd3_key invalid para");
                 goto invalid;
             }
 
@@ -2783,6 +2798,30 @@ ngx_http_upsync_send_handler(ngx_event_t *event)
         }
     }
 
+    if (upsync_type_conf->upsync_type == NGX_HTTP_UPSYNC_ETCDV3) {
+        ngx_str_t encoded_key;
+        ngx_encode_base64(&encoded_key, &upscf->upsync_etcd3_key);
+
+        u_char request_body[ngx_pagesize];
+        ngx_memzero(request_body, ngx_pagesize);
+
+        if (upsync_server->index != 0) {
+            ngx_sprintf(request_body, "{\"create_request\": {\"key\":\"%v\"}}", &encoded_key);
+            ngx_sprintf(request, "POST %V"
+                                " HTTP/1.0\r\nHost: %V\r\nAccept: */*\r\n\r\n",
+                                "%V"
+                        &upscf->upsync_send, &upscf->upsync_host, &request_body);
+
+        } else {
+            ngx_sprintf(request_body, "{\"key\":\"%v\"}", &encoded_key);
+            ngx_sprintf(request, "POST %V?"
+                                " HTTP/1.0\r\nHost: %V\r\nAccept: */*\r\n\r\n",""
+                                "%V",
+                        &upscf->upsync_send, &upscf->upsync_host, &request_body);
+
+        }
+    }
+
     ctx->send.pos = request;
     ctx->send.last = ctx->send.pos + ngx_strlen(request);
     while (ctx->send.pos < ctx->send.last) {
@@ -3827,6 +3866,12 @@ ngx_http_client_send(ngx_http_conf_client *client,
     if (upsync_type_conf->upsync_type == NGX_HTTP_UPSYNC_ETCD) {
         ngx_sprintf(request, "GET %V? HTTP/1.0\r\nHost: %V\r\n"
                     "Accept: */*\r\n\r\n", 
+                    &upscf->upsync_send, &upscf->conf_server.name);
+    }
+
+    if (upsync_type_conf->upsync_type == NGX_HTTP_UPSYNC_ETCDV3) {
+        ngx_sprintf(request, "POST %V? HTTP/1.0\r\nHost: %V\r\n"
+                            "Accept: */*\r\n\r\n",
                     &upscf->upsync_send, &upscf->conf_server.name);
     }
 
