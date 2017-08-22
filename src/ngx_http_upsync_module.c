@@ -1661,7 +1661,7 @@ ngx_http_upsync_etcd_parse_json(void *data)
         upstream_conf->down = 0;
         upstream_conf->backup = 0;
 
-        cJSON *sub_attribute
+        cJSON *sub_attribute;
         temp0 = cJSON_GetObjectItem(server_next, "value");
         if (temp0 != NULL && ngx_strlen(temp0->valuestring) != 0) {
             if (isEtcdv3) {
