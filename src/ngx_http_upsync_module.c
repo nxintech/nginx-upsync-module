@@ -3076,13 +3076,14 @@ ngx_http_upsync_send_handler(ngx_event_t *event)
     }
 
     if (upsync_type_conf->upsync_type == NGX_HTTP_UPSYNC_ETCD_V3) {
-        // TODO is it OK that request_body size is also ngx_pagesize?
-        u_char request_body[ngx_pagesize];
-        ngx_memzero(request_body, ngx_pagesize);
+        // max fix size is 65, 128 is for revision revision
+        size_t size = ngx_base64_encoded_length(upscf->upsync_etcd3_key.len) * 2 + 128;
+        u_char request_body[size];
+        ngx_memzero(request_body, size);
 
         if (upsync_server->index != 0) {
             etd3_watch_body(request_body, &upscf->upsync_etcd3_key, upsync_server->index);
-            ngx_sprintf(request, "POST %V/kv/range HTTP/1.0\r\nHost: %V\r\n"
+            ngx_sprintf(request, "POST %V/watch HTTP/1.0\r\nHost: %V\r\n"
                                 "Accept: */*\r\n\r\n",
                         "%s", // http body
                         &upscf->upsync_send, &upscf->conf_server.name,
@@ -3090,7 +3091,7 @@ ngx_http_upsync_send_handler(ngx_event_t *event)
 
         } else {
             etd3_kvrange_body(request_body, &upscf->upsync_etcd3_key);
-            ngx_sprintf(request, "POST %V/watch HTTP/1.0\r\nHost: %V\r\n"
+            ngx_sprintf(request, "POST %V/kv/range HTTP/1.0\r\nHost: %V\r\n"
                                 "Accept: */*\r\n\r\n",
                         "%s", // http body
                         &upscf->upsync_send, &upscf->conf_server.name,
@@ -4150,9 +4151,10 @@ ngx_http_client_send(ngx_http_conf_client *client,
     }
 
     if (upsync_type_conf->upsync_type == NGX_HTTP_UPSYNC_ETCD_V3) {
-        // TODO ngx_pagesize OK?
-        u_char request_body[ngx_pagesize];
-        ngx_memzero(request_body, ngx_pagesize);
+        // max fix size is 65, 128 is for revision revision
+        size_t size = ngx_base64_encoded_length(upscf->upsync_etcd3_key.len) * 2 + 128;
+        u_char request_body[size];
+        ngx_memzero(request_body, size);
         etd3_kvrange_body(request_body, &upscf->upsync_etcd3_key);
         ngx_sprintf(request, "POST %V/kv/range HTTP/1.0\r\nHost: %V\r\n"
                             "Accept: */*\r\n\r\n",
