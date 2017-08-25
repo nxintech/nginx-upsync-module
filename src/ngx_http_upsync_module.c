@@ -3084,16 +3084,16 @@ ngx_http_upsync_send_handler(ngx_event_t *event)
         if (upsync_server->index != 0) {
             etd3_watch_body(request_body, &upscf->upsync_etcd3_key, upsync_server->index);
             ngx_sprintf(request, "POST %V/watch HTTP/1.0\r\nHost: %V\r\n"
-                                "Accept: */*\r\n\r\n",
-                        "%s", // http body
+                                "Accept: */*\r\n\r\n"
+                                "%s", // http body
                         &upscf->upsync_send, &upscf->conf_server.name,
                         request_body);
 
         } else {
             etd3_kvrange_body(request_body, &upscf->upsync_etcd3_key);
             ngx_sprintf(request, "POST %V/kv/range HTTP/1.0\r\nHost: %V\r\n"
-                                "Accept: */*\r\n\r\n",
-                        "%s", // http body
+                                "Accept: */*\r\n\r\n"
+                                "%s",
                         &upscf->upsync_send, &upscf->conf_server.name,
                         request_body);
 
@@ -4157,8 +4157,8 @@ ngx_http_client_send(ngx_http_conf_client *client,
         ngx_memzero(request_body, size);
         etd3_kvrange_body(request_body, &upscf->upsync_etcd3_key);
         ngx_sprintf(request, "POST %V/kv/range HTTP/1.0\r\nHost: %V\r\n"
-                            "Accept: */*\r\n\r\n",
-                            "%s", // http body
+                            "Accept: */*\r\n\r\n"
+                            "%s",
                     &upscf->upsync_send, &upscf->conf_server.name,
                     request_body);
     }
