@@ -3313,7 +3313,7 @@ ngx_http_upsync_recv_handler(ngx_event_t *event)
             ngx_err_t  err;
 
             err = (size >= 0) ? 0 : ngx_socket_errno;
-            ngx_log_debug2(NGX_LOG_DEBUG, c->log, err,
+            ngx_log_debug2(NGX_LOG_DEBUG_HTTP, event->log, err,
                            "upsync_recv: recv size: %z, upsync_server: %V ",
                            size, upsync_server->pc.name);
         }
@@ -4255,6 +4255,7 @@ ngx_http_client_send(ngx_http_conf_client *client,
     }
 
     if (upsync_type_conf->upsync_type == NGX_HTTP_UPSYNC_ETCD_V3) {
+        etcd3_encode_base64(ctx->pool, &key, &upscf->upsync_etcd3_key);
         etcd3_get_prefix(prefix.data, &upscf->upsync_etcd3_key);
         etcd3_encode_base64(ctx->pool, &range_end, &prefix);
         size_t body_size = key.len + range_end.len + 32;
