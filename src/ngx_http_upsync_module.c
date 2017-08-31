@@ -1883,6 +1883,10 @@ ngx_http_upsync_etcd3_parse_json(void *data)
     cJSON *result = cJSON_GetObjectItem(root, "result");
     if (result != NULL) {
         cJSON *events = cJSON_GetObjectItem(result, "events");
+        if (events == NULL) {  // ignore watch create respoese
+            cJSON_Delete(root);
+            return NGX_ERROR;
+        }
 
         cJSON *event_next, *temp0, *kv;
         for (event_next = events->child; event_next != NULL;
@@ -3093,7 +3097,7 @@ ngx_http_upsync_connect_handler(ngx_event_t *event)
         return;
     }
 
-    /* NGX_OK or NGX_AGAIN */
+    /* NGX_OK or NGX_AGAIN or NGX_DONE */
     c = upsync_server->pc.connection;
     c->data = upsync_server;
     c->log = upsync_server->pc.log;
@@ -3325,6 +3329,7 @@ ngx_http_upsync_recv_handler(ngx_event_t *event)
         } else if (size == 0) {
             break;
         } else if (size == NGX_AGAIN) {
+            // TODO  handler EINPROGRESS     115
             return;
         } else {
             c->error = 1;
