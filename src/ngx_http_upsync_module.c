@@ -257,7 +257,7 @@ static ngx_int_t etcd3_get_prefix(u_char *end, ngx_str_t *key);
 static ngx_int_t etcd3_encode_base64(ngx_pool_t *pool, ngx_str_t *dst, ngx_str_t *src);
 static ngx_int_t etcd3_decode_base64(ngx_pool_t *pool, ngx_str_t *dst, ngx_str_t *src);
 static void etd3_kvrange_body(u_char *body, ngx_str_t *key, ngx_str_t *range_end);
-static void etd3_watch_body(u_char *body, ngx_str_t *key, ngx_str_t *range_end, uint64_t revision);
+static void etd3_watch_body(u_char *body, ngx_str_t *key, ngx_str_t *range_end);
 
 static http_parser_settings settings = {
     .on_message_begin = 0,
@@ -808,11 +808,12 @@ ngx_http_upsync_check_index(ngx_http_upsync_server_t *upsync_server)
         }
 
         // try get result first
+        cJSON *header = NULL;
         cJSON *result = cJSON_GetObjectItem(root, "result");
         if (result != NULL) {
-            cJSON *header = cJSON_GetObjectItem(result, "header");
+            header = cJSON_GetObjectItem(result, "header");
         } else {
-            cJSON *header = cJSON_GetObjectItem(root, "header");
+            header = cJSON_GetObjectItem(root, "header");
         }
 
         if (header != NULL && header->valuestring != NULL) {
@@ -1816,7 +1817,7 @@ ngx_http_upsync_etcd_parse_json(void *data)
 static ngx_int_t
 ngx_http_upsync_etcd3_parse_json(void *data)
 {
-    u_char                         *p;
+    u_char                         *pkey;
     uint64_t                        index = 0;
     ngx_buf_t                      *buf;
     ngx_str_t                       base64_src;
@@ -1865,88 +1866,114 @@ ngx_http_upsync_etcd3_parse_json(void *data)
         return NGX_ERROR;
     }
 
-    if (ngx_array_init(&ctx->upstream_conf, ctx->pool, 16,
-                       sizeof(*upstream_conf)) != NGX_OK)
+    if (ngx_array_init(&ctx->add_upstream, ctx->pool,
+                       16, sizeof(*upstream_conf)) != NGX_OK
+        && ngx_array_init(&ctx->del_upstream, ctx->pool,
+                          16, sizeof(*upstream_conf)) != NGX_OK
+        && ngx_array_init(&ctx->upstream_conf, ctx->pool,
+                          16, sizeof(*upstream_conf)) != NGX_OK)
     {
         ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
-                      "upsync_etcd3_parse_json: array init error");
+                      "upsync_etcd3_parse_json: init arrays error");
         cJSON_Delete(root);
         return NGX_ERROR;
     }
 
-    // try get result first, returned by watch
+    // response from watch
     cJSON *result = cJSON_GetObjectItem(root, "result");
     if (result != NULL) {
         cJSON *events = cJSON_GetObjectItem(result, "events");
-        // get last event
-        cJSON *event = events->child;
-        for (;;) {
-            if (event->next == NULL) { break; }
-            event = event->next;
+
+        cJSON *event_next, *temp0, *kv;
+        for (event_next = events->child; event_next != NULL;
+             event_next = event_next->next)
+        {
+            kv = cJSON_GetObjectItem(event_next, "kv");
+            if (kv == NULL) {
+                ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
+                              "upsync_etcd3_parse_json: event \"kv\" is null");
+                continue;
+            }
+
+            temp0 = cJSON_GetObjectItem(kv, "key");
+            if (temp0 != NULL && temp0->valuestring != NULL) {
+                base64_src.len = ngx_strlen(temp0->valuestring);
+                base64_src.data = (u_char *)temp0->valuestring;
+                if(etcd3_decode_base64(ctx->pool, &key, &base64_src) != NGX_OK) {
+                    ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
+                                  "upsync_etcd3_parse_json: base64 decode \"key\" error");
+                    continue;
+                }
+                ngx_log_debug1(NGX_LOG_DEBUG_HTTP, ngx_cycle->log, 0,
+                               "upsync_etcd3_parse_json: base64 decoded key \"%s\"", key.data);
+
+                pkey = (u_char *)ngx_strrchr((char *)key.data, '/');
+            }
+
+            temp0 = cJSON_GetObjectItem(event_next, "type");
+            if (temp0 != NULL && ngx_memcmp(temp0->valuestring, "DELETE", 6) == 0) {
+                upstream_conf = ngx_array_push(&ctx->del_upstream);
+                ngx_memzero(upstream_conf, sizeof(*upstream_conf));
+                ngx_sprintf(upstream_conf->sockaddr, "%*s", ngx_strlen(pkey + 1), pkey + 1);
+                continue;
+            }
+
+            temp0 = cJSON_GetObjectItem(event_next, "prev_kv");
+            if (temp0 == NULL) {
+                upstream_conf = ngx_array_push(&ctx->add_upstream);
+                ngx_memzero(upstream_conf, sizeof(*upstream_conf));
+                ngx_sprintf(upstream_conf->sockaddr, "%*s", ngx_strlen(pkey + 1), pkey + 1);
+            } else {
+                upstream_conf = ngx_array_push(&ctx->upstream_conf);
+                ngx_memzero(upstream_conf, sizeof(*upstream_conf));
+                ngx_sprintf(upstream_conf->sockaddr, "%*s", ngx_strlen(pkey + 1), pkey + 1);
+            }
+
+            temp0 = cJSON_GetObjectItem(kv, "value");
+            if (temp0 != NULL && ngx_strlen(temp0->valuestring) != 0) {
+                if (ngx_http_upsync_etcd3_parse_json_kv_value(
+                        ctx->pool, temp0, upstream_conf) != NGX_OK)
+                {
+                    ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
+                                  "upsync_etcd3_parse_json: parse value failed");
+                    continue;
+                }
+            }
+            temp0 = NULL;
         }
 
-        cJSON *kv = cJSON_GetObjectItem(event, "kv");
-        if (kv == NULL) {
+        ngx_uint_t add_err = 0, del_err = 0, update_err = 0;
+        if (ctx->add_upstream.nelts > 0) {
+            if (ngx_http_upsync_add_peers((ngx_cycle_t *)ngx_cycle, upsync_server) != NGX_OK) {
+                ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
+                              "upsync_etcd3_parse_json: upstream add peers failed");
+                add_err = 1;
+            }
+        }
+
+        if (ctx->del_upstream.nelts > 0) {
+            if (ngx_http_upsync_del_peers((ngx_cycle_t *)ngx_cycle, upsync_server) != NGX_OK) {
+                ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
+                              "upsync_etcd3_parse_json: upstream del peers failed");
+                del_err = 1;
+            }
+        }
+
+        if (ngx_http_upsync_update_peers((ngx_cycle_t *)ngx_cycle, upsync_server) != NGX_OK) {
             ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
-                          "upsync_etcd3_parse_json: event \"kv\" is null");
-            cJSON_Delete(root);
+                          "upsync_etcd3_parse_json: upstream update peer error");
+            update_err = 1;
+        }
+
+        cJSON_Delete(root);
+
+        if (add_err || del_err || update_err ) {
             return NGX_ERROR;
         }
-
-        cJSON *temp0 = cJSON_GetObjectItem(kv, "mod_revision");
-        if (temp0 != NULL) {
-            index = ngx_strtoull(temp0->valuestring, (char **) NULL, 10);
-            if (index < upsync_server->index) {
-                // ignore this response
-                ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
-                              "upsync_etcd3_parse_json: event mod_revision \"%uL\""
-                              " is smaller than current index \"%uL\"",
-                              index, upsync_server->index);
-                cJSON_Delete(root);
-                return NGX_ERROR;
-            }
-        }
-        temp0 = NULL;
-
-        temp0 = cJSON_GetObjectItem(event, "type");
-        if (temp0 != NULL) {
-            if (ngx_memcmp(temp0->valuestring, "DELETE", 6) == 0) {
-                return NGX_ERROR;
-            }
-        }
-        temp0 = NULL;
-
-        temp0 = cJSON_GetObjectItem(kv, "key");
-        if (temp0 != NULL && temp0->valuestring != NULL) {
-            base64_src.len = ngx_strlen(temp0->valuestring);
-            base64_src.data = (u_char *)temp0->valuestring;
-            if(etcd3_decode_base64(ctx->pool, &key, &base64_src) != NGX_OK) {
-                ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
-                              "upsync_etcd3_parse_json: base64 decode \"key\" error");
-                return NGX_ERROR;
-            }
-            ngx_log_debug1(NGX_LOG_DEBUG_HTTP, ngx_cycle->log, 0,
-                           "upsync_etcd3_parse_json: base64 decoded key \"%s\"", key.data);
-
-            if (ngx_http_upsync_check_key(key.data, upsync_server->host) != NGX_OK) {
-                return NGX_ERROR;
-            }
-
-            p = (u_char *)ngx_strrchr((char *)key.data, '/');
-            upstream_conf = ngx_array_push(&ctx->upstream_conf);
-            ngx_memzero(upstream_conf, sizeof(*upstream_conf));
-            ngx_sprintf(upstream_conf->sockaddr, "%*s", ngx_strlen(p + 1), p + 1);
-        }
-        temp0 = NULL;
-
-        // parse value, sign to upstream_conf
-        temp0 = cJSON_GetObjectItem(kv, "value");
-        if (value != NULL && ngx_strlen(value->valuestring) != 0) {
-            return ngx_http_upsync_etcd3_parse_json_kv_value(ctx->pool, temp0, upstream_conf);
-        }
+        goto dumpfile;
     }
 
-    // response returned by kvrange
+    // response from kvrange
     cJSON *kvs = cJSON_GetObjectItem(root, "kvs");
     if (kvs == NULL) {
         ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
@@ -1955,10 +1982,11 @@ ngx_http_upsync_etcd3_parse_json(void *data)
         return NGX_ERROR;
     }
 
-    cJSON *server_next;
+    cJSON *server_next, *temp0;
     for (server_next = kvs->child; server_next != NULL;
-         server_next = server_next->next) {
-        cJSON *temp0 = cJSON_GetObjectItem(server_next, "key");
+         server_next = server_next->next)
+    {
+        temp0 = cJSON_GetObjectItem(server_next, "key");
         if (temp0 != NULL && temp0->valuestring != NULL) {
             base64_src.len = ngx_strlen(temp0->valuestring);
             base64_src.data = (u_char *) temp0->valuestring;
@@ -1970,25 +1998,34 @@ ngx_http_upsync_etcd3_parse_json(void *data)
             ngx_log_debug1(NGX_LOG_DEBUG_HTTP, ngx_cycle->log, 0,
                            "upsync_etcd3_parse_json: decoded key \"%s\"", key.data);
 
-            if (ngx_http_upsync_check_key(key.data, upsync_server->host) != NGX_OK) {
-                continue;
-            }
-            p = (u_char *) ngx_strrchr((char *) key.data, '/');
+            pkey = (u_char *) ngx_strrchr((char *) key.data, '/');
             upstream_conf = ngx_array_push(&ctx->upstream_conf);
             ngx_memzero(upstream_conf, sizeof(*upstream_conf));
-            ngx_sprintf(upstream_conf->sockaddr, "%*s", ngx_strlen(p + 1), p + 1);
+            ngx_sprintf(upstream_conf->sockaddr, "%*s", ngx_strlen(pkey + 1), pkey + 1);
         }
-        temp0 = NULL;
 
-        temp0 = cJSON_GetObjectItem(kv, "value");
-        if (value != NULL && ngx_strlen(value->valuestring) != 0) {
-            if (ngx_http_upsync_etcd3_parse_json_kv_value(ctx->pool, temp0, upstream_conf) != NGX_OK) {
+        temp0 = cJSON_GetObjectItem(server_next, "value");
+        if (temp0 != NULL && ngx_strlen(temp0->valuestring) != 0) {
+            if (ngx_http_upsync_etcd3_parse_json_kv_value(
+                    ctx->pool, temp0, upstream_conf) != NGX_OK)
+            {
+                ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
+                              "upsync_etcd3_parse_json: parse value failed");
                 continue;
             }
         }
     }
     cJSON_Delete(root);
     return NGX_OK;
+
+dumpfile:
+    if (ngx_shmtx_trylock(&upsync_server->upsync_accept_mutex)) {
+        ngx_http_upsync_dump_server(upsync_server);
+        ngx_shmtx_unlock(&upsync_server->upsync_accept_mutex);
+    }
+    // return NGX_ERROR back to ngx_http_upsync_process
+    // make ngx_http_upsync_process return earlier
+    return NGX_ERROR;
 }
 
 
@@ -1997,7 +2034,7 @@ ngx_http_upsync_etcd3_parse_json_kv_value(ngx_pool_t *pool, cJSON *root, ngx_htt
 {
     ngx_str_t                      base64_src;
     ngx_str_t                      base64_dst;
-    ngx_int_t                       max_fails=2, backup=0, down=0;
+    ngx_int_t                      max_fails=1, backup=0, down=0;
 
 
     /* default value, server attribute */
@@ -2010,10 +2047,10 @@ ngx_http_upsync_etcd3_parse_json_kv_value(ngx_pool_t *pool, cJSON *root, ngx_htt
 
     base64_src.len = ngx_strlen(root->valuestring);
     base64_src.data = (u_char *)root->valuestring;
-    if (ngx_decode_base64(pool, &base64_dst, &base64_src) != NGX_OK) {
+    if (etcd3_decode_base64(pool, &base64_dst, &base64_src) != NGX_OK) {
         ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
                       "etcd3_parse_json_kv_value: decode value \"%s\" error",
-                      value->valuestring);
+                      root->valuestring);
         return NGX_ERROR;
     }
 
@@ -3096,6 +3133,10 @@ ngx_http_upsync_send_handler(ngx_event_t *event)
     upscf = upsync_server->upscf;
     upsync_type_conf = upscf->upsync_type_conf;
 
+    u_char prefix_data[upscf->upsync_etcd3_key.len];
+    prefix.len = upscf->upsync_etcd3_key.len;
+    prefix.data = prefix_data;
+
     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, c->log, 0, "upsync_send");
 
     ctx = &upsync_server->ctx;
@@ -3131,12 +3172,12 @@ ngx_http_upsync_send_handler(ngx_event_t *event)
         etcd3_encode_base64(ctx->pool, &key, &upscf->upsync_etcd3_key);
         etcd3_get_prefix(prefix.data, &upscf->upsync_etcd3_key);
         etcd3_encode_base64(ctx->pool, &range_end, &prefix);
-        size_t body_size = ngx_strlen(key) + ngx_strlen(range_end) + NGX_INT64_LEN;
-        u_char request_body[size];
-        ngx_memzero(request_body, size);
+        size_t body_size = key.len + range_end.len  + 64;
+        u_char request_body[body_size];
+        ngx_memzero(request_body, body_size);
 
         if (upsync_server->index != 0) {
-            etd3_watch_body(request_body, &key, &range_end, upsync_server->index);
+            etd3_watch_body(request_body, &key, &range_end);
             ngx_sprintf(request, "POST %V/watch HTTP/1.0\r\nHost: %V\r\n"
                                 "Accept: */*\r\nContent-Length: %d\r\n"
                                 "\r\n%s", // http body
@@ -4187,13 +4228,13 @@ ngx_http_client_send(ngx_http_conf_client *client,
     ngx_upsync_conf_t           *upsync_type_conf;
     ngx_http_upsync_srv_conf_t  *upscf;
 
+    ctx = &upsync_server->ctx;
+    upscf = upsync_server->upscf;
+    upsync_type_conf = upscf->upsync_type_conf;
+
     u_char prefix_data[upscf->upsync_etcd3_key.len];
     prefix.len = upscf->upsync_etcd3_key.len;
     prefix.data = prefix_data;
-
-    ctx = upsync_server->ctx;
-    upscf = upsync_server->upscf;
-    upsync_type_conf = upscf->upsync_type_conf;
 
     u_char request[ngx_pagesize];
     ngx_memzero(request, ngx_pagesize);
@@ -4216,9 +4257,9 @@ ngx_http_client_send(ngx_http_conf_client *client,
     if (upsync_type_conf->upsync_type == NGX_HTTP_UPSYNC_ETCD_V3) {
         etcd3_get_prefix(prefix.data, &upscf->upsync_etcd3_key);
         etcd3_encode_base64(ctx->pool, &range_end, &prefix);
-        size_t body_size = ngx_strlen(key) + ngx_strlen(range_end) + NGX_INT64_LEN;
-        u_char request_body[size];
-        ngx_memzero(request_body, size);
+        size_t body_size = key.len + range_end.len + 32;
+        u_char request_body[body_size];
+        ngx_memzero(request_body, body_size);
 
         etd3_kvrange_body(request_body, &key, &range_end);
         ngx_sprintf(request, "POST %V/kv/range HTTP/1.0\r\nHost: %V\r\n"
@@ -4244,7 +4285,7 @@ ngx_http_client_send(ngx_http_conf_client *client,
         {
             ngx_log_debug2(NGX_LOG_DEBUG_HTTP, ngx_cycle->log, 0,
                            "ngx_http_client_send: send size: %z, total: %z",
-                           tmp_send, size,);
+                           tmp_send, size);
         }
 #endif
         send_num += tmp_send;
@@ -4449,7 +4490,7 @@ end:
 
 /* original from etcd/clientv3/op.go  getPrefix */
 static ngx_int_t
-etcd3_get_prefix(ngx_str_t *end, ngx_str_t *key)
+etcd3_get_prefix(u_char *end, ngx_str_t *key)
 {
     ngx_memcpy(end, key->data, key->len);
     int i;
@@ -4506,8 +4547,8 @@ etd3_kvrange_body(u_char *body, ngx_str_t *key, ngx_str_t *range_end)
  * return {"create_request": {"key":"Zm9v","range_end":"Zm9w","start_revision":1234}}
  */
 static void
-etd3_watch_body(u_char *body, ngx_str_t *key, ngx_str_t *range_end, uint64_t revision)
+etd3_watch_body(u_char *body, ngx_str_t *key, ngx_str_t *range_end)
 {
-    ngx_sprintf(body, "{\"create_request\":{\"key\":\"%V\",\"range_end\":\"%V\",\"start_revision\":%uL}}",
-                key, range_end, revision);
+    ngx_sprintf(body, "{\"create_request\":{\"key\":\"%V\",\"range_end\":\"%V\",\"prev_kv\":true}}",
+                key, range_end);
 }
