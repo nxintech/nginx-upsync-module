@@ -1868,9 +1868,9 @@ ngx_http_upsync_etcd3_parse_json(void *data)
 
     if (ngx_array_init(&ctx->add_upstream, ctx->pool,
                        16, sizeof(*upstream_conf)) != NGX_OK
-        && ngx_array_init(&ctx->del_upstream, ctx->pool,
+        || ngx_array_init(&ctx->del_upstream, ctx->pool,
                           16, sizeof(*upstream_conf)) != NGX_OK
-        && ngx_array_init(&ctx->upstream_conf, ctx->pool,
+        || ngx_array_init(&ctx->upstream_conf, ctx->pool,
                           16, sizeof(*upstream_conf)) != NGX_OK)
     {
         ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
