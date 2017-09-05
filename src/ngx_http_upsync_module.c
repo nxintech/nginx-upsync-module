@@ -69,6 +69,7 @@ typedef struct {
     ngx_buf_t                        send;
     ngx_buf_t                        recv;
 
+    ngx_uint_t                       header_parsed;
     ngx_buf_t                        body;
 
     ngx_array_t                      del_upstream;  /* ngx_http_upsync_conf_t */
@@ -184,12 +185,14 @@ static ngx_int_t ngx_http_upsync_parse_dump_file(
 static void ngx_http_upsync_begin_handler(ngx_event_t *event);
 static void ngx_http_upsync_connect_handler(ngx_event_t *event);
 static void ngx_http_upsync_recv_handler(ngx_event_t *event);
+static void ngx_http_upsync_etcd3_recv_handler(ngx_event_t *event);
 static void ngx_http_upsync_send_handler(ngx_event_t *event);
 static void ngx_http_upsync_recv_empty_handler(ngx_event_t *event);
 static void ngx_http_upsync_send_empty_handler(ngx_event_t *event);
 static void ngx_http_upsync_timeout_handler(ngx_event_t *event);
 static void ngx_http_upsync_clean_event(void *upsync_server);
 static ngx_int_t ngx_http_upsync_etcd_parse_init(void *upsync_server);
+static ngx_int_t ngx_http_upsync_etcd3_parse_init(void *upsync_server);
 static ngx_int_t ngx_http_upsync_consul_parse_init(void *upsync_server);
 static ngx_int_t ngx_http_upsync_dump_server(
     ngx_http_upsync_server_t *upsync_server);
@@ -268,6 +271,17 @@ static http_parser_settings settings = {
     .on_body = ngx_http_body,
     .on_headers_complete = 0,
     .on_message_complete = 0
+};
+
+static http_parser_settings etcd3_settings = {
+        .on_message_begin = 0,
+        .on_header_field = 0,
+        .on_header_value = 0,
+        .on_url = 0,
+        .on_status = ngx_http_status,
+        .on_body = ngx_http_body,
+        .on_headers_complete = 0,
+        .on_message_complete = 0
 };
 
 ngx_atomic_t   upsync_shared_created0;
@@ -372,8 +386,8 @@ static ngx_upsync_conf_t  ngx_upsync_types[] = {
     { ngx_string("etcd3"),
       NGX_HTTP_UPSYNC_ETCD_V3,
       ngx_http_upsync_send_handler,
-      ngx_http_upsync_recv_handler,
-      ngx_http_upsync_etcd_parse_init,
+      ngx_http_upsync_etcd3_recv_handler,
+      ngx_http_upsync_etcd3_parse_init,
       ngx_http_upsync_etcd3_parse_json,
       ngx_http_upsync_clean_event },
 
@@ -686,8 +700,11 @@ ngx_http_upsync_process(ngx_http_upsync_server_t *upsync_server)
         return;
     }
 
-    if (ngx_http_upsync_check_index(upsync_server) == NGX_ERROR) {
-        return;
+    if (upsync_type_conf->upsync_type != NGX_HTTP_UPSYNC_ETCD_V3
+        && !ctx->header_parsed)
+    {
+        if(ngx_http_upsync_check_index(upsync_server) == NGX_ERROR)
+            return;
     }
 
     if (upsync_type_conf->parse(upsync_server) == NGX_ERROR) {
@@ -1205,8 +1222,10 @@ ngx_http_upsync_update_peers(ngx_cycle_t *cycle,
     
     peers = (ngx_http_upstream_rr_peers_t *)uscf->peer.data;
 
-    if (peers->number != ctx->upstream_conf.nelts) {
-        return NGX_ERROR;
+    if (upsync_server->upscf->upsync_type_conf->upsync_type != NGX_HTTP_UPSYNC_ETCD_V3) {
+        if (peers->number != ctx->upstream_conf.nelts) {
+            return NGX_ERROR;
+        }
     }
 
     len = ctx->upstream_conf.nelts;
@@ -1829,15 +1848,13 @@ ngx_http_upsync_etcd3_parse_json(void *data)
     ctx = &upsync_server->ctx;
     buf = &ctx->body;
 
-    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, ngx_cycle->log, 0,
-                   "upsync_etcd3_parse_json: parse buff \"%s\"", (char *)buf->pos);
-
     cJSON *root = cJSON_Parse((char *)buf->pos);
     if (root == NULL) {
         ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
                       "upsync_etcd3_parse_json: root error");
         return NGX_ERROR;
     }
+    ctx->recv.pos = ctx->recv.last;
 
     cJSON *error = cJSON_GetObjectItem(root, "error");
     if (error != NULL) {
@@ -1884,6 +1901,8 @@ ngx_http_upsync_etcd3_parse_json(void *data)
     if (result != NULL) {
         cJSON *events = cJSON_GetObjectItem(result, "events");
         if (events == NULL) {  // ignore watch create respoese
+            ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
+                          "upsync_etcd3_parse_json: result events is NULL");
             cJSON_Delete(root);
             return NGX_ERROR;
         }
@@ -3180,22 +3199,21 @@ ngx_http_upsync_send_handler(ngx_event_t *event)
         u_char request_body[body_size];
         ngx_memzero(request_body, body_size);
 
-        if (upsync_server->index != 0) {
-            etd3_watch_body(request_body, &key, &range_end);
-            ngx_sprintf(request, "POST %V/watch HTTP/1.0\r\nHost: %V\r\n"
-                                "Accept: */*\r\nContent-Length: %d\r\n"
-                                "\r\n%s", // http body
-                        &upscf->upsync_send, &upscf->conf_server.name,
-                        ngx_strlen(request_body), request_body);
-
-        } else {
-            etd3_kvrange_body(request_body, &key, &range_end);
-            ngx_sprintf(request, "POST %V/kv/range HTTP/1.0\r\nHost: %V\r\n"
-                                "Accept: */*\r\nContent-Length: %d\r\n"
-                                "\r\n%s",
-                        &upscf->upsync_send, &upscf->conf_server.name,
-                        ngx_strlen(request_body), request_body);
-        }
+//        if (upsync_server->index != 0) {
+        etd3_watch_body(request_body, &key, &range_end);
+        ngx_sprintf(request, "POST %V/watch HTTP/1.0\r\nHost: %V\r\n"
+                            "Accept: */*\r\nContent-Length: %d\r\n"
+                            "\r\n%s", // http body
+                    &upscf->upsync_send, &upscf->conf_server.name,
+                    ngx_strlen(request_body), request_body);
+//
+//        }
+//        etd3_kvrange_body(request_body, &key, &range_end);
+//        ngx_sprintf(request, "POST %V/kv/range HTTP/1.0\r\nHost: %V\r\n"
+//                            "Accept: */*\r\nContent-Length: %d\r\n"
+//                            "\r\n%s",
+//                    &upscf->upsync_send, &upscf->conf_server.name,
+//                    ngx_strlen(request_body), request_body);
     }
 
     ctx->send.pos = request;
@@ -3329,7 +3347,6 @@ ngx_http_upsync_recv_handler(ngx_event_t *event)
         } else if (size == 0) {
             break;
         } else if (size == NGX_AGAIN) {
-            // TODO  handler EINPROGRESS     115
             return;
         } else {
             c->error = 1;
@@ -3348,6 +3365,132 @@ ngx_http_upsync_recv_handler(ngx_event_t *event)
     return;
 
 upsync_recv_fail:
+    ngx_log_error(NGX_LOG_ERR, event->log, 0,
+                  "upsync_recv: recv error with upstream: \"%V\"",
+                  &upsync_server->host);
+
+    ngx_http_upsync_clean_event(upsync_server);
+}
+
+
+static void
+ngx_http_upsync_etcd3_recv_handler(ngx_event_t *event)
+{
+    u_char                                *new_buf;
+    ssize_t                                size, n;
+    ngx_pool_t                            *pool;
+    ngx_connection_t                      *c;
+    ngx_upsync_conf_t                     *upsync_type_conf;
+    ngx_http_upsync_ctx_t                 *ctx;
+    ngx_http_upsync_server_t              *upsync_server;
+
+    if (ngx_http_upsync_need_exit()) {
+        return;
+    }
+
+    c = event->data;
+    upsync_server = c->data;
+    ctx = &upsync_server->ctx;
+    upsync_type_conf = upsync_server->upscf->upsync_type_conf;
+
+    if (ctx->pool == NULL) {
+        pool = ngx_create_pool(NGX_DEFAULT_POOL_SIZE, ngx_cycle->log);
+        if (pool == NULL) {
+            ngx_log_error(NGX_LOG_ERR, event->log, 0,
+                          "upsync_recv: recv not enough memory");
+            return;
+        }
+        ctx->pool = pool;
+
+    } else {
+        pool = ctx->pool;
+    }
+
+    if (ctx->recv.start == NULL) {
+        /* 1 of the page_size, is it enough? */
+        ctx->recv.start = ngx_pcalloc(pool, ngx_pagesize);
+        if (ctx->recv.start == NULL) {
+            goto upsync_recv_fail;
+        }
+
+        ctx->recv.last = ctx->recv.pos = ctx->recv.start;
+        ctx->recv.end = ctx->recv.start + ngx_pagesize;
+    }
+
+    while (1) {
+        n = ctx->recv.end - ctx->recv.last;
+
+        /* buffer not big enough? enlarge it by twice */
+        if (n == 0) {
+            size = ctx->recv.end - ctx->recv.start;
+            new_buf = ngx_pcalloc(pool, size * 2);
+            if (new_buf == NULL) {
+                goto upsync_recv_fail;
+            }
+            ngx_memcpy(new_buf, ctx->recv.start, size);
+
+            ctx->recv.pos = ctx->recv.start = new_buf;
+            ctx->recv.last = new_buf + size;
+            ctx->recv.end = new_buf + size * 2;
+
+            n = ctx->recv.end - ctx->recv.last;
+        }
+
+        size = c->recv(c, ctx->recv.last, n);
+
+#if (NGX_DEBUG)
+        {
+            ngx_err_t  err;
+
+            err = (size >= 0) ? 0 : ngx_socket_errno;
+            ngx_log_debug2(NGX_LOG_DEBUG_HTTP, event->log, err,
+                           "upsync_etcd3_recv: recv size: %z, upsync_server: %V ",
+                           size, upsync_server->pc.name);
+        }
+#endif
+
+        if (size > 0) {
+            ctx->recv.last += size;
+            continue;
+        }
+        if (size == 0) {
+            break;
+        }
+        if (size == NGX_AGAIN) {
+            // TODO  EINPROGRESS 115
+            ngx_log_debug1(NGX_LOG_DEBUG_HTTP, event->log, ngx_socket_errno,
+                           "upsync_etcd3_recv: NGX_AGAIN ctx->recv.pos %s",
+                           ctx->recv.pos);
+            //ctx->recv.pos = ctx->recv.last;
+            break;
+        }
+        if(size == NGX_ERROR){
+            c->error = 1;
+            goto upsync_recv_fail;
+        }
+    }
+
+    if (upsync_type_conf->init(upsync_server) == NGX_AGAIN) {
+        // need recv again
+        if (!c->read->ready) {
+            ngx_log_debug0(NGX_LOG_DEBUG_HTTP, event->log, 0,
+                           "upsync_etcd3_recv: upsync_type_conf->init NGX_AGAIN,add timer");
+            ngx_add_timer(c->read, 100);
+        }
+        return;
+    }
+
+    if (upsync_type_conf->init(upsync_server) == NGX_OK) {
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, event->log, 0,
+                       "upsync_etcd3_recv: goto ngx_http_upsync_process");
+
+        ngx_http_upsync_process(upsync_server);
+//        c->read->handler = ngx_http_upsync_recv_empty_handler;
+    }
+//    upsync_type_conf->clean(upsync_server);
+    return;
+
+    upsync_recv_fail:
     ngx_log_error(NGX_LOG_ERR, event->log, 0,
                   "upsync_recv: recv error with upstream: \"%V\"",
                   &upsync_server->host);
@@ -3491,6 +3634,87 @@ ngx_http_upsync_etcd_parse_init(void *data)
     }
     
     return NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_http_upsync_etcd3_parse_init(void *data)
+{
+    char                                  *buf;
+    size_t                                 parsed;
+    ngx_http_upsync_ctx_t                 *ctx;
+    ngx_http_upsync_server_t              *upsync_server = data;
+
+    ctx = &upsync_server->ctx;
+    ctx->body.pos = ctx->body.last = NULL;
+
+    if (ngx_http_parser_init() == NGX_ERROR) {
+        return NGX_ERROR;
+    }
+
+    buf = (char *)ctx->recv.pos;
+
+    parsed = http_parser_execute(parser, &etcd3_settings, buf, ngx_strlen(buf));
+    if (parsed != ngx_strlen(buf)) {
+        if(ctx->header_parsed) {
+
+            ngx_log_debug1(NGX_LOG_DEBUG_HTTP, ngx_cycle->log, 0,
+                           "upsync_etcd3_parse_init: http header parsed before,index %L",
+                           upsync_server->index);
+            goto header_parsed;
+        }
+        ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
+                      "upsync_etcd3_parse_init: parsed upstream \"%V\" wrong",
+                      &upsync_server->host);
+        goto parse_error;
+    }
+
+    if (ngx_strncmp(state.status, "Bad", 3) == 0) {
+        goto parse_error;
+    }
+
+    // TODO http parse
+    if (ngx_strncmp(state.status, "OK", 2) == 0
+        && ngx_strlen(state.http_body) == 0)
+    {
+        if (parser != NULL) {
+            ngx_free(parser);
+            parser = NULL;
+        }
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, ngx_cycle->log, 0,
+                       "upsync_etcd3_parse_init: eof at http header");
+        ctx->recv.pos = ctx->recv.last;
+        ctx->header_parsed = 1;
+        return NGX_AGAIN;
+    }
+
+    if (ngx_strlen(state.http_body) != 0) {
+        ctx->body.pos = state.http_body;
+        ctx->body.last = state.http_body + ngx_strlen(state.http_body);
+        *(ctx->body.last + 1) = '\0';
+        if (parser != NULL) {
+            ngx_free(parser);
+            parser = NULL;
+        }
+        return NGX_OK;
+    }
+
+header_parsed:
+    if (parser != NULL) {
+        ngx_free(parser);
+        parser = NULL;
+    }
+    ctx->body.pos = ctx->recv.pos;
+    ctx->body.last = ctx->recv.pos + ngx_strlen((char *)ctx->recv.pos);
+    *(ctx->body.last + 1) = '\0';
+    return NGX_OK;
+
+parse_error:
+    if (parser != NULL) {
+        ngx_free(parser);
+        parser = NULL;
+    }
+    return NGX_ERROR;
 }
 
 
@@ -4201,7 +4425,7 @@ ngx_http_client_conn(ngx_http_conf_client *client)
 {
     if (connect(client->sd, (struct sockaddr *)&(client->addr), 
                 sizeof(struct sockaddr)) == NGX_ERROR) {
-        // FIXME need to handle connect be interrupted
+        // TODO  handle connect return EINTR
         return NGX_ERROR;
     }
 
